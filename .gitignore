@@ -1,0 +1,19 @@
+# Fichiers 3D volumineux
+*.stl
+*.obj
+*.3mf
+*.gcode
+*.step
+*.stp
+
+# Dossiers de résultats
+10cm*/
+15cm/
+continents/
+enregistrement globe/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
