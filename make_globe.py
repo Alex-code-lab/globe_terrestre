@@ -18,8 +18,8 @@ from PIL import Image
 from stl import mesh
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-SVG_FILE   = Path.home() / "Desktop/globe_terrestre/BlankMap_World_simple3.svg"
-OUTPUT_STL        = Path.home() / "Desktop/globe_10cm.stl"
+SVG_FILE   = Path.home() / "/Users/souchaud/Documents/Impression 3D/globe_terrestre/BlankMap_World_simple3.svg"
+# OUTPUT_STL        = Path.home() / "Desktop/globe_10cm.stl"
 OUTPUT_DIR        = Path.home() / "Desktop/continents"   # one STL per continent
 MIN_CONTINENT_QUADS = 40   # ignore islands smaller than this many quads
 RADIUS     = 75.0   # mm  (15 cm diameter)
@@ -40,7 +40,12 @@ INSERT_CLEAR = -0.1  # mm — négatif = léger serrage (plus précis sur les pe
 LIP_W        = 0.6   # mm — largeur de la collerette (débord fin, suit mieux les détails)
 LIP_DEPTH    = 1.0   # mm — épaisseur de la collerette (profondeur sous la face visible)
 # Continents à forcer en ajustement exact (corps = forme du trou, jupe légère)
-EXACT_FIT_CONTINENTS = {"australia"}
+# "*" = tous les continents / îles en exact-fit
+EXACT_FIT_CONTINENTS = {"*"}
+# ── Trou de support (tube vertical, inclinaison axiale terrestre) ─────────────
+SUPPORT_TUBE_RADIUS = 2.6   # mm — rayon du trou (tube Ø 5 mm + 0.2 mm jeu)
+SUPPORT_HOLE_DEPTH  = 30.0  # mm — profondeur du trou depuis la surface du globe
+AXIAL_TILT_DEG      = 23.5  # °  — obliquité de l'écliptique (inclinaison réelle de la Terre)
 # ── Principe de rétention : la collerette (> trou) repose sur la surface globe ─
 # Insert impossible à faire tomber ; retrait uniquement par poussée de l'intérieur
 # (après ouverture des deux hémisphères via le snap-fit équatorial).
@@ -290,7 +295,90 @@ def build_globe_south(land_map: np.ndarray) -> np.ndarray:
         _frustum_walls( r_grv,  z_b,    r_sock, z_bot,  outward=False),  # gorge se ferme
     ])
     bot = _disk(r_sock, z=z_bot, normal_pos_z=True)
-    return np.concatenate([dome, cap, walls, bot]).astype(np.float32)
+    south = np.concatenate([dome, cap, walls, bot]).astype(np.float32)
+    return _add_support_hole(south)
+
+
+def _add_support_hole(triangles: np.ndarray) -> np.ndarray:
+    """
+    Perce un trou cylindrique borgne dans l'hémisphère Sud pour accueillir un
+    tube de support vertical de Ø 5 mm.
+
+    Géométrie :
+      - Le globe est incliné de AXIAL_TILT_DEG (23,5°) sur son support.
+      - Le trou est aligné avec un tube vertical → dans le repère du globe,
+        le trou pointe à 23,5° de l'axe polaire Sud.
+      - Point d'entrée = point le plus bas du globe sur son support.
+      - Profondeur : SUPPORT_HOLE_DEPTH mm.
+
+    Requiert : pip install trimesh manifold3d
+    """
+    try:
+        import manifold3d as md
+        import trimesh
+    except ImportError:
+        print("  ⚠ manifold3d/trimesh non installé — trou de support ignoré.")
+        print("    → pip install trimesh manifold3d")
+        return triangles
+
+    tilt = np.radians(AXIAL_TILT_DEG)
+
+    # Direction "monde vertical" dans le repère du globe incliné à 23,5°.
+    # Le cylindre (axe Z par défaut) est pivoté de tilt° autour de Y.
+    d = np.array([np.sin(tilt), 0.0, np.cos(tilt)])   # vecteur sortant du trou
+
+    # Point d'entrée du trou sur la surface de la sphère
+    p_entry = -RADIUS * d
+
+    # Le cylindre dépasse de 5 mm hors de la sphère pour un perçage propre
+    cyl_len  = SUPPORT_HOLE_DEPTH + 5.0
+    p_start  = p_entry - 5.0 * d                      # 5 mm hors sphère
+    cyl_ctr  = p_start + (cyl_len / 2.0) * d          # centre du cylindre
+
+    # ── Créer le cylindre via manifold3d ──────────────────────────────────────
+    # cylinder(height, radius_low) centré à l'origine, axe Z
+    cyl = md.Manifold.cylinder(
+        height=cyl_len,
+        radius_low=SUPPORT_TUBE_RADIUS,
+        circular_segments=64,
+        center=True,
+    )
+    # Pivoter de tilt° autour de Y → aligne l'axe Z du cylindre sur d
+    cyl = cyl.rotate([0.0, float(np.degrees(tilt)), 0.0])
+    # Translater vers le bon emplacement
+    cyl = cyl.translate(cyl_ctr.tolist())
+
+    # ── Convertir les triangles numpy en Manifold ─────────────────────────────
+    # Merger les sommets dupliqués (triangle soup → mesh indexé)
+    verts_raw = triangles.reshape(-1, 3).astype(np.float32)
+    faces_raw = np.arange(len(verts_raw), dtype=np.uint32).reshape(-1, 3)
+    tm_tmp = trimesh.Trimesh(vertices=verts_raw, faces=faces_raw, process=True)
+    tm_tmp.merge_vertices(digits_vertex=4)
+    tm_tmp.remove_unreferenced_vertices()
+    verts = tm_tmp.vertices.astype(np.float32)
+    faces = tm_tmp.faces.astype(np.uint32)
+    globe_m = md.Manifold(md.Mesh(vert_properties=verts, tri_verts=faces))
+
+    if globe_m.status() != md.Error.NoError:
+        print(f"  ⚠ Mesh invalide ({globe_m.status()}) — trou ignoré.")
+        return triangles
+
+    # ── Soustraction booléenne ────────────────────────────────────────────────
+    result = globe_m - cyl
+
+    if result.is_empty() or result.num_tri() == 0:
+        print("  ⚠ Résultat vide — trou de support ignoré.")
+        return triangles
+
+    # ── Convertir le résultat en triangles numpy ──────────────────────────────
+    rm = result.to_mesh()
+    r_verts = np.array(rm.vert_properties, dtype=np.float32)
+    r_faces = np.array(rm.tri_verts,       dtype=np.int32)
+    out = r_verts[r_faces]   # (N, 3, 3) — tableau de triangles
+
+    print(f"  Trou de support : Ø {SUPPORT_TUBE_RADIUS * 2:.1f} mm  |  "
+          f"profondeur {SUPPORT_HOLE_DEPTH:.0f} mm  |  inclinaison {AXIAL_TILT_DEG}°")
+    return out.astype(np.float32)
 
 
 def _draw_cut(img: np.ndarray, lat0: float, lon0: float,
@@ -422,7 +510,13 @@ def build_continent_inserts(land_map: np.ndarray, red_mask: np.ndarray = None):
     Return a list of (filename_stem, triangles) — one closed mesh per connected
     land region (continent / island).  Requires scipy.
     """
-    from scipy.ndimage import label as ndlabel, binary_erosion, binary_dilation, binary_opening
+    from scipy.ndimage import (
+        label as ndlabel,
+        binary_erosion,
+        binary_dilation,
+        binary_opening,
+        binary_closing,
+    )
 
     # INSERT_CLEAR > 0 → érosion (jeu, insert plus petit que le creux)
     # INSERT_CLEAR = 0 → ajustement exact
@@ -524,8 +618,13 @@ def build_continent_inserts(land_map: np.ndarray, red_mask: np.ndarray = None):
     _quad_mm = 2 * np.pi * RADIUS / LON_STEPS      # mm par quad à l'équateur
     n_lip    = max(1, round(LIP_W / _quad_mm))
 
-    # Label connected components (8-connectivity to link diagonally touching quads)
-    labeled, n_comp = ndlabel(lq, structure=np.ones((3, 3)))
+    force_all_exact_fit = "*" in EXACT_FIT_CONTINENTS
+
+    # Label connected components (8-connectivity to link diagonally touching quads).
+    # Si tout est en exact-fit, on segmente directement sur lq_fit pour conserver
+    # les contours exacts des trous (évite des jupes "hachées" ou amputées).
+    lq_components = lq_fit if force_all_exact_fit else lq
+    labeled, n_comp = ndlabel(lq_components, structure=np.ones((3, 3)))
 
     # Seed points pour nommer automatiquement les grandes masses continentales
     CONTINENT_SEEDS = [
@@ -563,7 +662,9 @@ def build_continent_inserts(land_map: np.ndarray, red_mask: np.ndarray = None):
             name = f"{name}_{used_names[name]}"
         else:
             used_names[name] = 1
-        is_exact_fit = any(name == n or name.startswith(f"{n}_") for n in EXACT_FIT_CONTINENTS)
+        is_exact_fit = force_all_exact_fit or any(
+            name == n or name.startswith(f"{n}_") for n in EXACT_FIT_CONTINENTS
+        )
 
         # Cas exact-fit : le corps suit exactement la forme du trou du globe.
         if is_exact_fit:
@@ -573,11 +674,13 @@ def build_continent_inserts(land_map: np.ndarray, red_mask: np.ndarray = None):
         else:
             mask_body = mask
 
-        # Jupe "partout" : dilation directe du contour (pas de lissage global qui gomme les détails).
+        # Jupe : dilation du contour + lissage léger pour éviter les dents/pics.
         mask_lip = _bdil(mask_body, iterations=n_lip)
+        mask_lip = binary_closing(mask_lip, structure=np.ones((3, 3)), iterations=1)
 
         # Empêche la jupe de recouvrir un autre continent ou une ligne de coupure.
-        mask_lip[lq & ~mask_body] = False
+        occupied = lq_fit if is_exact_fit else lq
+        mask_lip[occupied & ~mask_body] = False
         mask_lip[cut_any] = False
         mask_lip |= mask_body
 

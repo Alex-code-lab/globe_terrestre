@@ -16,4 +16,5 @@ enregistrement globe/
 __pycache__/
 *.pyc
 *.pyo
+impression3D/
 .DS_Store
