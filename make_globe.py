@@ -42,6 +42,12 @@ LIP_DEPTH    = 1.0   # mm — épaisseur de la collerette (profondeur sous la fa
 # Continents à forcer en ajustement exact (corps = forme du trou, jupe légère)
 # "*" = tous les continents / îles en exact-fit
 EXACT_FIT_CONTINENTS = {"*"}
+# Activer/désactiver les coupures rouges du SVG (traits .st0 / stroke:red).
+# False = les traits rouges sont ignorés (pas de trou/coupure imposé par ces traits).
+ENABLE_RED_CUTS = False
+# Activer/désactiver les coupures géographiques automatiques (Suez, Gibraltar, Oural, ...)
+# False = respecter strictement le SVG (pas de trous/coupures ajoutés par le code).
+ENABLE_GEOGRAPHIC_CUTS = False
 # ── Trou de support (tube vertical, inclinaison axiale terrestre) ─────────────
 SUPPORT_TUBE_RADIUS = 2.6   # mm — rayon du trou (tube Ø 5 mm + 0.2 mm jeu)
 SUPPORT_HOLE_DEPTH  = 30.0  # mm — profondeur du trou depuis la surface du globe
@@ -534,17 +540,20 @@ def build_continent_inserts(land_map: np.ndarray, red_mask: np.ndarray = None):
     # Masque "fit exact" = même base que le trou du globe (sans INSERT_CLEAR).
     land_map_fit = np.where(land_b, 0, 255).astype(np.uint8)
 
-    # Coupures géographiques automatiques (robustes, même sans traits rouges SVG).
-    _before_geo_insert = land_map_insert < LAND_THRESHOLD
-    _before_geo_fit    = land_map_fit < LAND_THRESHOLD
-    land_map_insert = _apply_geographic_cuts(land_map_insert)
-    land_map_fit    = _apply_geographic_cuts(land_map_fit)
-    geo_cut_px = (_before_geo_insert & ~(land_map_insert < LAND_THRESHOLD)) | (
-        _before_geo_fit & ~(land_map_fit < LAND_THRESHOLD)
-    )
+    # Coupures géographiques automatiques (optionnel).
+    if ENABLE_GEOGRAPHIC_CUTS:
+        _before_geo_insert = land_map_insert < LAND_THRESHOLD
+        _before_geo_fit    = land_map_fit < LAND_THRESHOLD
+        land_map_insert = _apply_geographic_cuts(land_map_insert)
+        land_map_fit    = _apply_geographic_cuts(land_map_fit)
+        geo_cut_px = (_before_geo_insert & ~(land_map_insert < LAND_THRESHOLD)) | (
+            _before_geo_fit & ~(land_map_fit < LAND_THRESHOLD)
+        )
+    else:
+        geo_cut_px = np.zeros_like(land_map, dtype=bool)
 
-    # 1) Pixels rouges SVG → océan forcé (avant _land_flag)
-    if red_mask is not None:
+    # 1) Pixels rouges SVG → océan forcé (avant _land_flag), optionnel
+    if ENABLE_RED_CUTS and red_mask is not None:
         land_map_insert[red_mask] = 255
         land_map_fit[red_mask] = 255
 
@@ -571,7 +580,7 @@ def build_continent_inserts(land_map: np.ndarray, red_mask: np.ndarray = None):
     _i_img  = ((np.pi/2 - _lats_q) / np.pi * img_h).clip(0, img_h-1).astype(int)
     _j_img  = ((_lons_q + np.pi) / (2*np.pi) * img_w).clip(0, img_w-1).astype(int)
 
-    if red_mask is not None:
+    if ENABLE_RED_CUTS and red_mask is not None:
         red_q = red_mask[np.ix_(_i_img, _j_img)]
         red_any = (red_q[:LAT_STEPS, :LON_STEPS] | red_q[1:, :LON_STEPS] |
                    red_q[:LAT_STEPS,  1:]         | red_q[1:,  1:])
@@ -620,11 +629,10 @@ def build_continent_inserts(land_map: np.ndarray, red_mask: np.ndarray = None):
 
     force_all_exact_fit = "*" in EXACT_FIT_CONTINENTS
 
-    # Label connected components (8-connectivity to link diagonally touching quads).
-    # Si tout est en exact-fit, on segmente directement sur lq_fit pour conserver
-    # les contours exacts des trous (évite des jupes "hachées" ou amputées).
-    lq_components = lq_fit if force_all_exact_fit else lq
-    labeled, n_comp = ndlabel(lq_components, structure=np.ones((3, 3)))
+    # Segmentation des continents/pièces sur le masque "insert" (lq) uniquement.
+    # L'exact-fit s'applique ensuite sur la forme du corps (mask_body = mask & lq_fit)
+    # sans fusionner artificiellement des masses continentales.
+    labeled, n_comp = ndlabel(lq, structure=np.ones((3, 3)))
 
     # Seed points pour nommer automatiquement les grandes masses continentales
     CONTINENT_SEEDS = [
