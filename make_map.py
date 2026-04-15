@@ -58,7 +58,7 @@ BORDER_H_MM      = 2.0   # mm — hauteur du rebord périphérique
 BUTTON_R_MM      = 3.6   # mm — rayon du bouton de préhension des continents (2× plus large)
 BUTTON_H_MM      = 10.0  # mm — hauteur du bouton au-dessus de la face visible
 BUTTON_SEGMENTS  = 24    # segments du cylindre (plus = plus rond)
-BUTTON_ANCHOR_MM = 0.4   # mm — ancrage du bouton dans la pièce (vers le bas)
+BUTTON_ANCHOR_MM = 1.0   # mm — ancrage du bouton dans la pièce (vers le bas)
 
 # Continents avec bouton de préhension (autres îles n'en ont pas)
 BUTTON_CONTINENTS = {"north_america", "south_america", "africa", "europe", "asia", "australia", "antarctica"}
@@ -98,6 +98,8 @@ if BUTTON_SEGMENTS < 8:
     raise ValueError("BUTTON_SEGMENTS doit être >= 8.")
 if BUTTON_ANCHOR_MM < 0.0:
     raise ValueError("BUTTON_ANCHOR_MM doit être >= 0.")
+if BUTTON_ANCHOR_MM >= POCKET_DEPTH:
+    raise ValueError("BUTTON_ANCHOR_MM doit être strictement < POCKET_DEPTH.")
 
 
 # ── Rasterisation SVG (identique à make_globe.py) ─────────────────────────────
@@ -632,7 +634,7 @@ def build_continent_insert(lq_body, lq_lip, add_button=False):
       z = -POCKET_DEPTH — fond du corps (repose sur le fond du creux)
 
     Surfaces :
-      1. Face sup (z=0)        : collerette + corps (+Z)  ← sert aussi de base du bouton
+      1. Face sup (z=0)        : collerette + corps (+Z)
       2. Dessous collerette    : anneau (collerette − corps) à z=-LIP_DEPTH (-Z)
       3. Fond du corps         : corps à z=-POCKET_DEPTH (-Z)
       4. Parois ext collerette : de z=0 à z=-LIP_DEPTH  (outward)
@@ -642,8 +644,8 @@ def build_continent_insert(lq_body, lq_lip, add_button=False):
     Pourquoi un pavé et pas un cylindre ?
       Un cylindre fermé (fond + couvercle) crée DEUX coques distinctes dans le STL.
       Le slicer les imprime comme deux objets → délaminage immédiat.
-      Ici le bouton partage la face z=0 du continent → une seule coque continue,
-      manifold et sans surface intérieure → pièce unique garantie.
+      Avec BUTTON_ANCHOR_MM > 0, le pied du bouton descend sous z=0
+      (jusqu'à -BUTTON_ANCHOR_MM) pour augmenter l'ancrage mécanique.
     """
     from scipy.ndimage import distance_transform_edt
 
@@ -652,34 +654,48 @@ def build_continent_insert(lq_body, lq_lip, add_button=False):
     Vi = _make_verts(-POCKET_DEPTH)
 
     lip_only = lq_lip & ~lq_body
+    btn = None
 
-    tris = [
-        _top_face(lq_lip,  Vo),          # 1. top complet (= plancher du bouton si add_button)
-        _bot_face(lip_only, Vl),         # 2. dessous collerette
-        _bot_face(lq_body,  Vi),         # 3. fond corps
-        _walls_outward(lq_lip,  Vo, Vl), # 4. parois ext collerette
-        _walls_outward(lq_body, Vl, Vi), # 5. épaulement corps
-    ]
-
-    # 6) Bouton intégré : pavé quad aligné sur la grille, surface continue avec le continent.
-    #    Pas de fond séparé — la face z=0 (tris[0]) constitue déjà le plancher du bouton.
+    # Bouton intégré : pavé quad aligné sur la grille.
     if add_button and BUTTON_R_MM > 0.0 and BUTTON_H_MM > 0.0:
         dist = distance_transform_edt(lq_body)
         if dist.size and dist.max() > 1.0:
             si, sj = np.unravel_index(np.argmax(dist), dist.shape)
             n_qx = max(1, round(BUTTON_R_MM / (MAP_W / GRID_X)))
             n_qy = max(1, round(BUTTON_R_MM / (MAP_H / GRID_Y)))
-            btn = np.zeros((GRID_Y, GRID_X), dtype=bool)
-            btn[max(0, si - n_qy):min(GRID_Y, si + n_qy + 1),
-                max(0, sj - n_qx):min(GRID_X, sj + n_qx + 1)] = True
-            btn &= lq_body   # rester dans les limites du continent
-            if btn.any():
-                V_btn = _make_verts(BUTTON_H_MM)
-                tris += [
-                    _top_face(btn, V_btn),           # toit du bouton  (z = BUTTON_H_MM)
-                    _walls_outward(btn, V_btn, Vo),  # parois latérales (z = BUTTON_H_MM → 0)
-                    # plancher = face sup continent déjà dans tris[0], pas de doublon
-                ]
+            b = np.zeros((GRID_Y, GRID_X), dtype=bool)
+            b[max(0, si - n_qy):min(GRID_Y, si + n_qy + 1),
+              max(0, sj - n_qx):min(GRID_X, sj + n_qx + 1)] = True
+            b &= lq_body  # rester dans les limites du continent
+            if b.any():
+                btn = b
+
+    top_mask = lq_lip
+    tris = [
+        _top_face(top_mask, Vo),         # 1. top continent complet (z=0)
+        _bot_face(lip_only, Vl),         # 2. dessous collerette
+        _bot_face(lq_body,  Vi),         # 3. fond corps
+        _walls_outward(lq_lip,  Vo, Vl), # 4. parois ext collerette
+        _walls_outward(lq_body, Vl, Vi), # 5. épaulement corps
+    ]
+
+    # 6) Bouton : ancrage sous z=0 si BUTTON_ANCHOR_MM > 0.
+    if btn is not None:
+        V_btn = _make_verts(BUTTON_H_MM)
+        if BUTTON_ANCHOR_MM > 0.0:
+            V_anchor = _make_verts(-BUTTON_ANCHOR_MM)
+            tris += [
+                _top_face(btn, V_btn),              # toit du bouton
+                _bot_face(btn, V_anchor),           # pied ancré sous la surface
+                _walls_outward(btn, V_btn, V_anchor),  # parois du bouton (H → -anchor)
+            ]
+        else:
+            # Cas sans ancrage : union propre avec retrait de la face z=0 sous le bouton.
+            tris[0] = _top_face(lq_lip & ~btn, Vo)
+            tris += [
+                _top_face(btn, V_btn),
+                _walls_outward(btn, V_btn, Vo),
+            ]
 
     return np.concatenate(tris, axis=0).astype(np.float32)
 
