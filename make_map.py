@@ -47,7 +47,7 @@ MIN_CONTINENT_QUADS =  40   # ignorer les composantes < N quads
 
 BASE_THICK       = 5.0   # mm — épaisseur de la plaque de base
 POCKET_DEPTH     = 3.0   # mm — profondeur des creux continents (doit être < BASE_THICK)
-INSERT_CLEARANCE = 0.2   # mm — jeu entre le corps du continent et son logement
+INSERT_CLEARANCE = 0.3   # mm — jeu entre le corps du continent et son logement
                           #      0   = ajustement exact
                           #      > 0 = jeu (plus facile à insérer/retirer)
 LIP_W            = 1.2   # mm — largeur de la collerette (dépasse du creux)
@@ -55,12 +55,15 @@ LIP_DEPTH        = 0.8   # mm — épaisseur de la collerette
 LIP_SMOOTH_MM    = 0.30  # mm — lissage du contour de jupe (supprime dents/pics)
 BORDER_W_MM      = 2.0   # mm — largeur du rebord périphérique (hors jonction)
 BORDER_H_MM      = 2.0   # mm — hauteur du rebord périphérique
-BUTTON_R_MM      = 1.8   # mm — rayon du bouton de préhension des continents
+BUTTON_R_MM      = 3.6   # mm — rayon du bouton de préhension des continents (2× plus large)
 BUTTON_H_MM      = 10.0  # mm — hauteur du bouton au-dessus de la face visible
 BUTTON_SEGMENTS  = 24    # segments du cylindre (plus = plus rond)
 BUTTON_ANCHOR_MM = 0.4   # mm — ancrage du bouton dans la pièce (vers le bas)
 
-ENABLE_GEOGRAPHIC_CUTS = False   # Suez, Panama, Oural…
+# Continents avec bouton de préhension (autres îles n'en ont pas)
+BUTTON_CONTINENTS = {"north_america", "south_america", "africa", "europe", "asia", "australia", "antarctica"}
+
+ENABLE_GEOGRAPHIC_CUTS = True    # Suez, Panama, Oural… (nécessaire pour séparer Amériques)
 ENABLE_RED_CUTS        = False   # traits rouges dans le SVG source
 MIRROR_X               = True    # True = miroir horizontal (gauche/droite)
 MIRROR_Y               = False   # True = miroir vertical (haut/bas)
@@ -221,13 +224,36 @@ def _fix_diagonal_contacts(mask):
 # ── Segmentation continents ────────────────────────────────────────────────────
 
 def _name_component(mask, img_h, img_w):
+    """
+    Nomme un composant via deux passes :
+    - Passe 1 (directe) : la graine tombe dans le composant (rayon 10 px ≈ 0.9°).
+      Fiable et sans risque de débordement vers un continent voisin.
+    - Passe 2 (centroïde) : fallback — renvoie la graine la plus proche du centroïde
+      du composant. Nécessaire quand la graine tombe dans un gap SVG.
+    """
+    rows, cols = np.where(mask)
+    if len(rows) == 0:
+        return None
+    cy, cx = float(rows.mean()), float(cols.mean())
+
+    # Passe 1 : graine directement dans le composant (petit rayon, sans ambiguïté)
+    r_direct = 10
     for lat, lon, name in CONTINENT_SEEDS:
-        ci = int(np.clip((90 - lat)  / 180 * img_h, 0, img_h - 2))
+        ci = int(np.clip((90 - lat) / 180 * img_h, 0, img_h - 2))
         cj = int(np.clip((lon + 180) / 360 * img_w, 0, img_w - 2))
-        r  = 20
-        if mask[max(0, ci - r):ci + r + 1, max(0, cj - r):cj + r + 1].any():
+        if mask[max(0, ci - r_direct):ci + r_direct + 1,
+                max(0, cj - r_direct):cj + r_direct + 1].any():
             return name
-    return None
+
+    # Passe 2 : centroïde le plus proche d'une graine (pour fragments sans graine directe)
+    best_name, best_dist = None, float('inf')
+    for lat, lon, name in CONTINENT_SEEDS:
+        ci = (90 - lat) / 180 * img_h
+        cj = (lon + 180) / 360 * img_w
+        d = (cy - ci) ** 2 + (cx - cj) ** 2
+        if d < best_dist:
+            best_dist, best_name = d, name
+    return best_name
 
 
 def label_continents(land_map, red_mask=None):
@@ -342,6 +368,27 @@ def label_continents(land_map, red_mask=None):
         lq_lip = _fix_diagonal_contacts(lq_lip)
 
         results.append((name, lq_body, lq_exact, lq_lip))
+
+    # ── Renommage : le fragment le plus grand de chaque continent prend le nom primaire ──
+    # Exemple : si "australia_3" est le plus grand, il devient "australia",
+    # et les petits fragments sont renumérotés à partir de _2.
+    known_bases = {n for _, _, n in CONTINENT_SEEDS}
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for idx, (name, lq_body, lq_exact, lq_lip) in enumerate(results):
+        parts = name.rsplit('_', 1)
+        base = parts[0] if len(parts) > 1 and parts[1].isdigit() else name
+        if base in known_bases:
+            groups[base].append((lq_body.sum(), idx))
+    rename_map: dict = {}
+    for base, frags in groups.items():
+        frags.sort(reverse=True, key=lambda x: x[0])   # plus grand en premier
+        for rank, (_, idx) in enumerate(frags):
+            old = results[idx][0]
+            rename_map[old] = base if rank == 0 else f"{base}_{rank + 1}"
+    results = [(rename_map.get(n, n), a, b, c) for n, a, b, c in results]
+
+    for name, lq_body, lq_exact, lq_lip in results:
         print(f"    {name:25s}: {lq_body.sum():>7,} quads (corps)  "
               f"{lq_exact.sum():>7,} (creux)  {lq_lip.sum():>7,} (collerette)")
 
@@ -395,36 +442,6 @@ def _outer_border_mask(footprint_mask, n_q):
     band[:, -n_q:] = True
     return footprint_mask & band
 
-
-def _cylinder_button(cx, cy, radius, z0, z1, segments):
-    """
-    Petit cylindre fermé (parois + capot haut + capot bas) pour le bouton de préhension.
-    """
-    a = np.linspace(0.0, 2.0 * np.pi, segments, endpoint=False)
-    ca = np.cos(a)
-    sa = np.sin(a)
-    xb = cx + radius * ca
-    yb = cy + radius * sa
-
-    pb = np.stack([xb, yb, np.full(segments, z0)], axis=1)
-    pt = np.stack([xb, yb, np.full(segments, z1)], axis=1)
-    cb = np.array([cx, cy, z0], dtype=np.float32)
-    ct = np.array([cx, cy, z1], dtype=np.float32)
-
-    j = np.arange(segments)
-    jn = (j + 1) % segments
-
-    # Paroi latérale (normales outward)
-    side1 = np.stack([pb[j], pt[j], pt[jn]], axis=1)
-    side2 = np.stack([pb[j], pt[jn], pb[jn]], axis=1)
-
-    # Capot supérieur (+Z)
-    top = np.stack([np.repeat(ct[None, :], segments, axis=0), pt[j], pt[jn]], axis=1)
-
-    # Capot inférieur (-Z)
-    bot = np.stack([np.repeat(cb[None, :], segments, axis=0), pb[jn], pb[j]], axis=1)
-
-    return np.concatenate([side1, side2, top, bot], axis=0).astype(np.float32)
 
 
 # ── Primitives triangles ──────────────────────────────────────────────────────
@@ -605,7 +622,7 @@ def build_base_plate(continent_data, footprint_mask=None):
     return np.concatenate(tris, axis=0).astype(np.float32)
 
 
-def build_continent_insert(lq_body, lq_lip):
+def build_continent_insert(lq_body, lq_lip, add_button=False):
     """
     Pièce continent à encastrer, avec collerette de retenue.
 
@@ -615,12 +632,18 @@ def build_continent_insert(lq_body, lq_lip):
       z = -POCKET_DEPTH — fond du corps (repose sur le fond du creux)
 
     Surfaces :
-      1. Face sup (z=0)        : collerette + corps (+Z)
+      1. Face sup (z=0)        : collerette + corps (+Z)  ← sert aussi de base du bouton
       2. Dessous collerette    : anneau (collerette − corps) à z=-LIP_DEPTH (-Z)
       3. Fond du corps         : corps à z=-POCKET_DEPTH (-Z)
       4. Parois ext collerette : de z=0 à z=-LIP_DEPTH  (outward)
       5. Épaulement            : de z=-LIP_DEPTH à z=-POCKET_DEPTH sur périmètre corps (outward)
-      6. Bouton de préhension  : petit cylindre en relief au centre utile
+      6. Bouton de préhension  : pavé quad intégré z=0→BUTTON_H_MM (pièce unique, pas de coque séparée)
+
+    Pourquoi un pavé et pas un cylindre ?
+      Un cylindre fermé (fond + couvercle) crée DEUX coques distinctes dans le STL.
+      Le slicer les imprime comme deux objets → délaminage immédiat.
+      Ici le bouton partage la face z=0 du continent → une seule coque continue,
+      manifold et sans surface intérieure → pièce unique garantie.
     """
     from scipy.ndimage import distance_transform_edt
 
@@ -631,29 +654,32 @@ def build_continent_insert(lq_body, lq_lip):
     lip_only = lq_lip & ~lq_body
 
     tris = [
-        _top_face(lq_lip,  Vo),          # 1. top complet
+        _top_face(lq_lip,  Vo),          # 1. top complet (= plancher du bouton si add_button)
         _bot_face(lip_only, Vl),         # 2. dessous collerette
         _bot_face(lq_body,  Vi),         # 3. fond corps
         _walls_outward(lq_lip,  Vo, Vl), # 4. parois ext collerette
         _walls_outward(lq_body, Vl, Vi), # 5. épaulement corps
     ]
 
-    # 6) Bouton de prise : placé au point le plus "intérieur" du continent
-    # pour minimiser le risque de déborder du contour.
-    if BUTTON_R_MM > 0.0 and BUTTON_H_MM > 0.0:
+    # 6) Bouton intégré : pavé quad aligné sur la grille, surface continue avec le continent.
+    #    Pas de fond séparé — la face z=0 (tris[0]) constitue déjà le plancher du bouton.
+    if add_button and BUTTON_R_MM > 0.0 and BUTTON_H_MM > 0.0:
         dist = distance_transform_edt(lq_body)
         if dist.size and dist.max() > 1.0:
             si, sj = np.unravel_index(np.argmax(dist), dist.shape)
-            q_mm = min(MAP_W / GRID_X, MAP_H / GRID_Y)
-            max_fit_r = max(0.0, (dist[si, sj] - 1.0) * q_mm)
-            r = min(BUTTON_R_MM, max_fit_r)
-
-            if r >= q_mm * 0.75:
-                cx = (sj + 0.5) * (MAP_W / GRID_X)
-                cy = (si + 0.5) * (MAP_H / GRID_Y)
-                z0 = -min(BUTTON_ANCHOR_MM, POCKET_DEPTH - 0.05)
-                z1 = BUTTON_H_MM
-                tris.append(_cylinder_button(cx, cy, r, z0, z1, BUTTON_SEGMENTS))
+            n_qx = max(1, round(BUTTON_R_MM / (MAP_W / GRID_X)))
+            n_qy = max(1, round(BUTTON_R_MM / (MAP_H / GRID_Y)))
+            btn = np.zeros((GRID_Y, GRID_X), dtype=bool)
+            btn[max(0, si - n_qy):min(GRID_Y, si + n_qy + 1),
+                max(0, sj - n_qx):min(GRID_X, sj + n_qx + 1)] = True
+            btn &= lq_body   # rester dans les limites du continent
+            if btn.any():
+                V_btn = _make_verts(BUTTON_H_MM)
+                tris += [
+                    _top_face(btn, V_btn),           # toit du bouton  (z = BUTTON_H_MM)
+                    _walls_outward(btn, V_btn, Vo),  # parois latérales (z = BUTTON_H_MM → 0)
+                    # plancher = face sup continent déjà dans tris[0], pas de doublon
+                ]
 
     return np.concatenate(tris, axis=0).astype(np.float32)
 
@@ -739,8 +765,21 @@ if __name__ == "__main__":
         save_stl(base_tris, OUTPUT_DIR / "map_base.stl")
 
     print("\n[4/4] Pièces continents…")
+    # Pour chaque continent majeur, seul le PLUS GRAND fragment reçoit un bouton.
+    from collections import defaultdict
+    frag_sizes: dict = defaultdict(list)
     for name, lq_body, lq_exact, lq_lip in continent_data:
-        tris = build_continent_insert(lq_body, lq_lip)
+        parts = name.rsplit('_', 1)
+        base = parts[0] if len(parts) > 1 and parts[1].isdigit() else name
+        frag_sizes[base].append((lq_body.sum(), name))
+    button_names: set = set()
+    for base, frags in frag_sizes.items():
+        if base in BUTTON_CONTINENTS:
+            largest_name = max(frags, key=lambda x: x[0])[1]
+            button_names.add(largest_name)
+
+    for name, lq_body, lq_exact, lq_lip in continent_data:
+        tris = build_continent_insert(lq_body, lq_lip, add_button=(name in button_names))
         save_stl(tris, cont_dir / f"{name}.stl")
 
     print(f"\nDone. Fichiers dans : {OUTPUT_DIR}/")
