@@ -65,11 +65,15 @@ BUTTON_CONTINENTS = {"north_america", "south_america", "africa", "europe", "asia
 
 ENABLE_GEOGRAPHIC_CUTS = True    # Suez, Panama, Oural… (nécessaire pour séparer Amériques)
 ENABLE_RED_CUTS        = False   # traits rouges dans le SVG source
+SEPARATE_CORSICA       = True    # Détache la Corse du continent (pont SVG artificiel)
+FILL_INTERIOR_SEAS     = True    # Comble les mers intérieures enclavées (Caspienne, Aral…)
+                                  # évite les trous dans la face supérieure des continents
 MIRROR_X               = True    # True = miroir horizontal (gauche/droite)
 MIRROR_Y               = False   # True = miroir vertical (haut/bas)
 
 # Découpe plateau en 2 pièces (coupe droite au milieu, sans attache spéciale).
 SPLIT_BASE_IN_TWO      = True   # True = export map_base_left/right.stl
+EXPORT_FULL_BASE_STL   = True   # True = export map_base.stl en plus (utile même si split)
 
 # Graines de nommage (identiques à make_globe.py)
 CONTINENT_SEEDS = [
@@ -81,6 +85,7 @@ CONTINENT_SEEDS = [
     (-25.0,  135.0, "australia"),
     (-80.0,    0.0, "antarctica"),
     ( 72.0,  -42.0, "greenland"),
+    ( 42.0,    9.0, "corsica"),
 ]
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -276,6 +281,9 @@ def label_continents(land_map, red_mask=None):
         img[red_mask] = 255
     if ENABLE_GEOGRAPHIC_CUTS:
         img = _apply_geographic_cuts(img)
+    if SEPARATE_CORSICA:
+        _draw_cut(img, 43.5,  7.0, 43.5, 11.0, 4)  # Mer Ligure (Corse ↔ continent)
+        _draw_cut(img, 41.4,  8.3, 41.4,  9.9, 3)  # Détroit de Bonifacio (Corse ↔ Sardaigne)
 
     land_bin = (img < LAND_THRESHOLD)
     land_bin = binary_opening(land_bin, structure=np.ones((3, 3)))
@@ -290,8 +298,10 @@ def label_continents(land_map, red_mask=None):
     else:
         land_insert = land_bin.copy()
 
-    # Segmentation sur le masque "insert" (avec jeu)
-    labeled, n_comp = ndlabel(land_insert, structure=np.ones((3, 3)))
+    # Segmentation sur le masque de terres exactes, puis application du jeu
+    # composant par composant. Cela permet de conserver les petites îles
+    # (ex. Corse) qui peuvent disparaître lorsqu'on érode d'abord l'ensemble.
+    labeled_exact, n_comp = ndlabel(land_bin, structure=np.ones((3, 3)))
     img_h, img_w = land_bin.shape
 
     # Largeur/lissage de jupe dans la grille STL (plus stable pour l'impression)
@@ -302,7 +312,7 @@ def label_continents(land_map, red_mask=None):
     # Pré-calcul des tailles de composantes (O(n) unique) pour court-circuiter
     # les opérations scipy coûteuses sur les milliers de micro-îles inférieures au seuil.
     # ~20 pixels/quad en moyenne (4000/900 × 2000/450) → seuil très conservateur = ×4.
-    comp_sizes = np.bincount(labeled.ravel())
+    comp_sizes = np.bincount(labeled_exact.ravel())
     min_px = MIN_CONTINENT_QUADS * 4
 
     used_names: dict = {}
@@ -311,14 +321,39 @@ def label_continents(land_map, red_mask=None):
         if comp_sizes[cid] < min_px:   # filtre rapide avant de créer mask_insert
             continue
 
-        mask_insert = labeled == cid
+        mask_exact = labeled_exact == cid
+
+        # Application du jeu de l'insert sur ce composant, sans perdre les
+        # petites îles qui disparaîtraient si on érodait l'ensemble au préalable.
+        if INSERT_CLEARANCE > 0:
+            from scipy.ndimage import distance_transform_edt
+            dist = distance_transform_edt(mask_exact)
+            max_radius = int(np.floor(dist.max()))
+            erode_iters = min(n_clr, max_radius)
+            if erode_iters > 0:
+                mask_insert = binary_erosion(mask_exact, iterations=erode_iters)
+            else:
+                mask_insert = mask_exact.copy()
+        elif INSERT_CLEARANCE < 0:
+            mask_insert = binary_dilation(mask_exact, iterations=n_clr)
+        else:
+            mask_insert = mask_exact.copy()
+
+        if not mask_insert.any():
+            continue
 
         # Passage en quads pour filtrer les micro-îles
-        lq_body = _fix_diagonal_contacts(_img_to_quad(mask_insert))
+        q_body  = _img_to_quad(mask_insert)
+        q_exact = _img_to_quad(mask_exact)
+        if FILL_INTERIOR_SEAS:
+            from scipy.ndimage import binary_fill_holes as _bfh
+            q_body  = _bfh(q_body)
+            q_exact = _bfh(q_exact)
+        lq_body = _fix_diagonal_contacts(q_body)
         if lq_body.sum() < MIN_CONTINENT_QUADS:
             continue
 
-        name = _name_component(mask_insert, img_h, img_w)
+        name = _name_component(mask_exact, img_h, img_w)
         if name is None:
             name = f"island_{cid:03d}"
         elif name in used_names:
@@ -327,22 +362,7 @@ def label_continents(land_map, red_mask=None):
         else:
             used_names[name] = 1
 
-        # Masque exact (sans jeu) → forme du creux dans la base
-        # On trouve la composante connexe correspondante dans land_bin
-        # en cherchant l'overlap avec mask_insert dilaté
-        overlap = land_bin & binary_dilation(mask_insert, iterations=n_clr + 2)
-        exact_labeled, _ = ndlabel(overlap, structure=np.ones((3, 3)))
-        seed_ci, seed_cj = np.where(mask_insert)
-        if len(seed_ci) == 0:
-            lq_exact = lq_body
-        else:
-            mid = len(seed_ci) // 2
-            exact_id = exact_labeled[seed_ci[mid], seed_cj[mid]]
-            if exact_id == 0:
-                lq_exact = lq_body
-            else:
-                lq_exact = _fix_diagonal_contacts(_img_to_quad(exact_labeled == exact_id))
-
+        lq_exact = _fix_diagonal_contacts(q_exact)
         components.append((name, lq_body, lq_exact))
 
     # Occupation totale des creux (tous continents confondus)
@@ -771,6 +791,9 @@ if __name__ == "__main__":
 
     print("\n[3/4] Plaque de base…")
     if SPLIT_BASE_IN_TWO:
+        if EXPORT_FULL_BASE_STL:
+            full_tris = build_base_plate(continent_data)
+            save_stl(full_tris, OUTPUT_DIR / "map_base.stl")
         left_mask, right_mask = _split_footprints()
         left_tris = build_base_plate(continent_data, left_mask)
         right_tris = build_base_plate(continent_data, right_mask)
@@ -794,13 +817,27 @@ if __name__ == "__main__":
             largest_name = max(frags, key=lambda x: x[0])[1]
             button_names.add(largest_name)
 
+    # Masque rebord : zone où la base est surélevée et où il n'y a pas de creux.
+    # Les pièces dont le corps/collerette déborde dans cette zone ne peuvent pas
+    # s'insérer (corps sans creux, collerette bloquée par le rebord).
+    border_q = max(1, round(BORDER_W_MM / (MAP_W / GRID_X))) if (BORDER_W_MM > 0 and BORDER_H_MM > 0) else 0
+    border_excl = _outer_border_mask(np.ones((GRID_Y, GRID_X), dtype=bool), border_q)
+
     for name, lq_body, lq_exact, lq_lip in continent_data:
-        tris = build_continent_insert(lq_body, lq_lip, add_button=(name in button_names))
+        body = lq_body & ~border_excl
+        lip  = lq_lip  & ~border_excl
+        if not body.any():
+            print(f"  {name}: entièrement dans la zone rebord, ignoré")
+            continue
+        tris = build_continent_insert(body, lip, add_button=(name in button_names))
         save_stl(tris, cont_dir / f"{name}.stl")
 
     print(f"\nDone. Fichiers dans : {OUTPUT_DIR}/")
     if SPLIT_BASE_IN_TWO:
-        print("  map_base_left.stl / map_base_right.stl  → 2 moitiés droites du plateau")
+        if EXPORT_FULL_BASE_STL:
+            print("  map_base.stl + map_base_left.stl / map_base_right.stl  → plateau entier + 2 moitiés")
+        else:
+            print("  map_base_left.stl / map_base_right.stl  → 2 moitiés droites du plateau")
     else:
         print("  map_base.stl   → plaque pleine avec creux  (imprimer en premier)")
     print(f"  continents/    → {len(continent_data)} pièces à encastrer")
